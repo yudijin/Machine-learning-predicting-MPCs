@@ -1,0 +1,377 @@
+rm(list=ls())
+data <- read.csv("data.csv", na.strings = c("", "NA", "NULL", "-"))
+data[] <- lapply(data, function(x) if(is.character(x)) as.factor(x) else x)
+str(data)
+
+library(mice)
+library(miceadds)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+#Smote
+data$Number <- ifelse(data$Number == "1", 0, 1)
+data$Number <- as.factor(data$Number)
+smote_data <- SMOTE(Number~.,data = data,perc.over = 100,perc.under = 100)
+data<-smote_data
+
+#3.欠采样
+#随机欠采样
+majority_class <- data %>% filter(Sequence == "0")
+minority_class <- data %>% filter(Sequence == "1")
+
+# 随机选择与少数类数量相同的多数类样本
+undersampled_majority <- majority_class %>% sample_n(nrow(minority_class))
+
+# 合并欠采样后的多数类和原始的少数类
+undersampled_data <- bind_rows(undersampled_majority, minority_class)
+data<-undersampled_data
+
+#4.基线表
+library(autoReg)
+ft2 <- gaze(Number~Age+Race+Sex+Marital+Laterality+Histology+Grade+AJCC+T+N+M+LNR+Bone+
+              Brain+Liver+Lung+Subtype+Surgery+Chemotherapy+Radiotherapy,
+            method=3,data=matched_data) %>%myft() #以group为分类
+print(ft2)
+library(rrtable)
+table2docx(ft2,target="Table selected")
+
+#5. logisitic单多因素
+overall.log <- glm(Sequence~Age+Race+Sex+Marital+Laterality+Histology+Grade+AJCC+T+N+Bone+
+                     Brain+Liver+Lung+Subtype+Surgery+Chemotherapy+Radiotherapy,data=data,family=binomial) 
+
+summary(overall.log)
+
+model1<-autoReg(overall.log,uni=T,multi=F,threshold=0.05)#只显示单因素
+model1
+library(rrtable)
+table2docx(model1,target="Logistic单因素")
+
+#6.Cox回归单多因素
+library("autoReg")
+library(survival)
+res<- coxph(Surv(Survival.months,OS) ~ Age+Race+Sex+Marital+Laterality+Histology+Grade+AJCC+T+N+M+LNR+Bone+
+              Brain+Liver+Lung+Subtype+Surgery+Chemotherapy+Radiotherapy, data = data)
+summary(res)
+
+model1<-autoReg(res,uni=TRUE,multi=T,threshold=0.05)
+model1
+write_xlsx(model1, "全部cox多因素分析.xlsx")
+
+#7.竞争风险
+library(foreign)
+library(cmprsk) ##加载竞争风险程序包
+#多因素
+data <- read.csv("C:/Users/75661/Desktop/cif.csv")
+summary(data$Survival.months)
+summary(data$status)
+
+covs <- subset(data, select = - c(Patient.ID,  
+                                  Survival.months, status)) 
+summary(covs)
+covs[] <- lapply(covs, function(x) if (is.integer(x)) as.factor(x) else x)
+f2 <- crr(data$Survival.months, data$status, covs, failcode = 1, cencode = 0) #建立多因素分析模型summary(f2) #展示结果
+summary(f2) #展示结果
+
+#8.筛选0.7，然后划分训练集
+library("caret")
+library("lattice")
+set.seed(1234)
+inTrain<-createDataPartition(y=data$Patient.ID,p=0.7,list=F)
+data_train<-data[inTrain,]
+data_test<-data[-inTrain,]
+
+#9.随机森林建模
+#随机森林调参
+library("randomForest")
+n<-length(names(data_train))     #计算数据集中自变量个数，等同n=ncol(train_data)
+rate=1     #设置模型误判率向量初始值
+for(i in 1:12){
+  set.seed(1234)
+  rf_data<-randomForest(as.factor(data_train$Number)~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy,data=data_train,mtry=i,ntree=1000)
+  rate[i]<-mean(rf_data$err.rate)   
+  print(rf_data)    
+}
+rate     #展示所有模型误判率的均值
+plot(rate)
+
+set.seed(1234)
+rf_data<-randomForest(as.factor(data_train$Number)~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy,data=data_train,mtry=4,ntree=1000)
+plot(rf_data)
+
+#final model
+model <- randomForest(as.factor(data_train$Number)~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy, 
+                      data=data_train, proximity=TRUE, mtry=4,ntree=1000, importance=TRUE) 
+print(model) 
+library("pROC")
+library("ROCR")
+
+oob.error <- data.frame(
+  Trees=rep(1:nrow(model$err.rate), times=3),
+  Type=rep(c("OOB", "0", "1"), 
+           each=nrow(model$err.rate)),
+  Error=c(model$err.rate[,"OOB"],
+          model$err.rate[,"0"],
+          model$err.rate[,"1"]))
+
+library("ggplot2")
+ggplot(oob.error, aes(x=Trees, y=Error)) + 
+  geom_line(aes(color=Type))+
+  theme_classic()
+
+model <- randomForest(Number~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy, 
+                      data=data_train, proximity=TRUE, mtry=4,ntree=500, importance=TRUE) 
+
+varImpPlot(model,pch=25) 
+
+library(ROCR)
+pred.train<-predict(model,data_train) 
+ran_preda<-prediction(pred.train,data_train$Number) #将预测结果和真实结果组合在一起 
+ran_AUCa <- performance(ran_preda, "auc") #计算AUC 
+AUC_rana<-round(ran_AUCa@y.values[[1]],3)  
+perfa<-performance(ran_preda,"tpr","fpr") #画出ROC曲线 
+plot(perfa,col="red") 
+segments(0,0,1,1,col="gray") 
+text(0.9,0.1,paste("AUC = ",AUC_rana)) 
+
+pred.test<-predict(model,data_test) 
+ran_predb<-prediction(pred.test,data_test$Number) #对验证集的预测 
+ran_AUCb <- performance(ran_predb, "auc") #计算AUC 
+AUC_ranb<-round(ran_AUCb@y.values[[1]],3)  
+perfb<-performance(ran_predb,"tpr","fpr") #画出ROC曲线 
+plot(perfb,col="red") 
+segments(0,0,1,1,col="gray") 
+text(0.9,0.1,paste("AUC = ",AUC_ranb)) 
+
+library(pROC)
+a<-roc(data_train$Number,pred.train,smooth=FALSE,plot=TRUE, 
+       auc=TRUE, auc.polygon=FALSE, print.auc=TRUE, print.thres=TRUE, grid=FALSE)
+ci.auc(a)
+
+pred.test<-predict(model,data_test) 
+b<-roc(data_test$Number==1,pred.test,smooth=FALSE,plot=TRUE, 
+       auc=TRUE, auc.polygon=FALSE, print.auc=TRUE, print.thres=TRUE, grid=FALSE)
+ci.auc(b)
+
+library(reportROC)
+reportROC(gold=data_test$Number,
+          predictor=pred.test,
+          important="se",
+          plot=TRUE)
+
+threshold <- 0.513  # 设置阈值
+predicted_classes <- ifelse(pred.test >= threshold, 1, 0)
+
+# 模型评估
+confusion_matrix <- table(data_test$Number, predicted_classes)
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+precision <- confusion_matrix[2, 2] / sum(confusion_matrix[, 2])
+recall <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+f1_score <- 2 * precision * recall / (precision + recall)
+
+#10 fold cross-validation
+set.seed(123)
+cv<-train(Number~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy,
+          data=data_train,method="rf",
+          trControl=trainControl(method="cv",number=10))
+
+#查看交叉验证结果
+print(cv)
+summary(cv)
+cv
+probs <- predict(cv, data_train)
+library(reportROC)
+reportROC(gold=data_train$Number,
+          predictor=probs,
+          important="se",
+          plot=TRUE)
+
+
+folds <- createFolds(y=data_train[,1],k=10)
+max=0
+num=0
+auc_value<-as.numeric()
+for(i in 1:10){
+  fold_test <- data[folds[[i]],]#取folds[[i]]作为测试集
+  fold_train <- data[-folds[[i]],]# 剩下的数据作为训练集
+  fold_pre <- randomForest(Number~Age+Histology+Grade+AJCC+T+N+Subtype+Chemotherapy+Surgery+Marital+Laterality,data=fold_train)
+  fold_predict <- predict(fold_pre,type='response',newdata=fold_test)
+  auc_value<- append(auc_value,as.numeric(auc(as.numeric(fold_test[,1]),fold_predict)))}
+num<-which.max(auc_value)
+print(auc_value)
+
+#10.Logistic回归
+f <- glm(Number~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy, data=data_train, family = binomial())
+summary(f)
+
+# 训练集
+library(ROCR)
+pred.lga<-predict(f,data_train,type="response") 
+lg_preda<-prediction(pred.lga,data_train$Number) #对验证集的预测 
+lg_AUCa <- performance(lg_preda, "auc") #计算AUC 
+AUC_lga<-round(lg_AUCa@y.values[[1]],3)  
+perflga<-performance(lg_preda,"tpr","fpr") #画出ROC曲线 
+plot(perflga,col="red") 
+segments(0,0,1,1,col="gray") 
+text(0.9,0.1,paste("AUC = ",AUC_lga))
+
+pred.lgb<-predict(f,data_test,type="response") 
+lg_predb<-prediction(pred.lgb,data_test$Number) #对验证集的预测 
+lg_AUCb <- performance(lg_predb, "auc") #计算AUC 
+AUC_lgb<-round(lg_AUCb@y.values[[1]],3)  
+perflgb<-performance(lg_predb,"tpr","fpr") #画出ROC曲线 
+plot(perflgb,col="red") 
+segments(0,0,1,1,col="gray") 
+text(0.9,0.1,paste("AUC = ",AUC_lgb))
+
+a<-roc(data_train$Number,pred.lga,smooth=FALSE,plot=TRUE, 
+       auc=TRUE, auc.polygon=FALSE, print.auc=TRUE, print.thres=TRUE, grid=FALSE)
+ci.auc(a)
+
+pred.test<-predict(f,data_test) 
+b<-roc(data_test$Number==1,pred.lgb,smooth=FALSE,plot=TRUE, 
+       auc=TRUE, auc.polygon=FALSE, print.auc=TRUE, print.thres=TRUE, grid=FALSE)
+ci.auc(b)
+
+library(reportROC)
+reportROC(gold=data_test$Number,
+          predictor=pred.lgb,
+          important="se",
+          plot=TRUE)
+
+threshold <- 0.538  # 设置阈值
+predicted_classes <- ifelse(pred.lga >= threshold, 1, 0)
+
+# 模型评估
+confusion_matrix <- table(data_train$Number, predicted_classes)
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+precision <- confusion_matrix[2, 2] / sum(confusion_matrix[, 2])
+recall <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+f1_score <- 2 * precision * recall / (precision + recall)
+
+set.seed(123)
+data_train$Number<-as.factor(data_train$Number)
+cv.lg<-train(Number~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy,
+             data=data_train,method="glm",
+             trControl=trainControl(method="cv",number=10))
+
+#查看交叉验证结果
+print(cv.lg)
+
+#ROC曲线画在一起
+plot(perfb, legacy.axes=TRUE, 
+     time=1, col="blue", lwd=2)   #time是时间点，col是线条颜色
+plot(perflgb, add=TRUE, 
+     time=2, col="red", lwd=2)    #add指是否添加在上一张图中
+segments(0,0,1,1,col="gray") 
+
+#添加标签信息
+legend("bottomright", 
+       legend = c("Random forest: AUC = 0.638", "Logistic regression: AUC = 0.646"), 
+       col = c("blue","red"), lty = c(1, 1))  # 添加图例
+
+#11.calibration
+#Logistic regression
+library(rms)
+fit<-lrm(Number~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy, x=TRUE,y=TRUE, data=data_train)
+cal<-calibrate(fit, method = 'boot', B=100, data = data_test)
+plot(cal, 
+     xlim=c(0,1.0),ylim=c(0,1.0),
+     xlab = "Predicted Probability",
+     ylab = "Observed Probability"
+)
+
+#随机森林
+p.rfb<-predict(model,data_test) 
+p3 <- sort(p.rfb) 
+p3 <- as.numeric(p3)
+predy3 <- seq(p3[1], p3[2058], length = 100)  #对X取值
+smo3 <- lowess(p.rfb, data_test$Number, iter = 0)
+calibrated.rfb <- approx(smo3, xout = predy3, ties = mean)$y 
+plot(predy3, calibrated.rfb, type = "l", lty=1,lwd=2, xlim=c(0,1),ylim=c(0,1), col= "red",xlab = "Predicted Probability",
+     ylab = "Observed Probability")
+lines(cal, col= "blue")
+abline(0,1,col="black",lty=2,lwd=2)
+legend(0.6,0.35,
+       c("Ideal","Brier score-Random forest: 0.140","Brier score-Logistic regression: 0.132"),
+       lty=c(2,1),
+       lwd=c(2,1),
+       col=c("black","red","blue"),
+       bty="n")
+
+#计算Logistic的多项指标
+pred.lg<- predict(fit, data_test)
+data_test$prob <- 1/(1+exp(-pred.lg))
+val.prob(data_test$prob,as.numeric(data_test$Number) , m=10, cex=.9)
+
+#12.DCA
+library(ggscidca)
+library(survival)
+library(reshape2)
+library(ggplot2)
+
+#Logistic回归
+fit<-glm(Number~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy,
+         family= binomial(link = "logit"),data=data_train)
+scidca(fit,newdata= data_test,threshold.line= T,threshold.text=T)
+
+#随机森林
+fit2<-randomForest(as.factor(Number)~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy,
+                   data=data_train,ntree=500, importance=TRUE,proximity=TRUE)
+scidca(fit2,newdata = data_test,threshold.line = T,threshold.text=T)
+
+#13.Nomogram
+library(rms)
+nomo<-datadist(data_train)
+options(datadist='nomo')
+fit <- lrm(Number~Age+Histology+Marital+Laterality+Grade+AJCC+T+N+Subtype+Surgery+Chemotherapy+Radiotherapy,
+           data = data_train, x= T, y= T)
+#查看回归结果
+fit
+library(regplot)
+nom<-regplot(fit, clickable=F, cex=6, 
+             points=TRUE, rank="sd",prfail = T)
+nom <- nomogram(fit, fun=plogis,
+                fun.at=c(.001,.01,.05,seq(.1,.9,by=.1),.95,.99,.999),
+                maxscale=100,
+                funlabel="risk")
+plot(nom)
+#得分
+library(nomogramFormula)
+
+
+prob <- prob_cal(fit)
+range(prob$linear.predictors)
+range(prob$Prob)
+library(data.table)
+library(rms)
+#计算total points
+total_points <- TotalPoints.rms(rd = data_train, fit = fit, nom = nom)
+
+#14.风险分层
+library("survival")
+library("survminer")
+#载入并查看数据集
+test<-read.csv("km.csv", header=T)
+
+#构建模型
+fit <- survfit(Surv(Survival.months, status) ~ group, data=test)
+fit
+plot(fit)
+
+#美化模型
+km <- ggsurvplot(fit, data = test,
+                 pval = TRUE,#添加P值
+                 pval.coord = c(0, 0.03), #调节Pval的位置
+                 palette=c("#da1f18", "#b6b51f", "#0780cf"),  #更改线的颜色
+                 legend.labs=c("High-risk","Low-risk","Medium-risk"), #标签
+                 legend.title="Risk",
+                 title="Risk stratification of the training set", #标题
+                 ylab="OS",xlab = " Time (months)", #更改横纵坐标
+                 censor.shape = 124,censor.size = 2,conf.int = FALSE, #删失点的形状和大小
+                 break.x.by = 12, #横坐标间隔
+                 risk.table = TRUE,tables.height = 0.2,
+                 tables.theme = theme_cleantable(),
+                 ggtheme = theme_bw())
+
+km
